@@ -26,6 +26,7 @@ Converted (v2 -> v1):
     panos_administrative_tag         -> panos_administrative_tag    (comments -> comment)
     panos_security_policy            -> panos_security_policy       (rules = [...] -> rule { } blocks)
     panos_security_policy_rules      -> panos_security_rule_group   (position -> position_keyword/reference)
+    panos_addresses                  -> panos_address_objects       (addresses = { ... } map -> object { } blocks)
     location = { vsys / device_group / shared }  -> vsys / device_group  (Panorama objects become the
                                                                      v1 panos_panorama_* resource types)
     References to renamed resources everywhere in your code.
@@ -491,6 +492,7 @@ TARGETS = {
     "tag": ("panos_administrative_tag", "panos_panorama_administrative_tag"),
     "policy": ("panos_security_policy", "panos_security_policy"),
     "rule_group": ("panos_security_rule_group", "panos_security_rule_group"),
+    "addresses": ("panos_address_objects", "panos_address_objects"),
 }
 
 KIND = {
@@ -501,6 +503,7 @@ KIND = {
     "panos_administrative_tag": "tag", "panos_panorama_administrative_tag": "tag",
     "panos_security_policy": "policy",
     "panos_security_policy_rules": "rule_group", "panos_security_rule_group": "rule_group",
+    "panos_addresses": "addresses",
 }
 
 # Attributes that only exist in v2 - if a block has none of these it is already v1 and is left alone.
@@ -512,6 +515,7 @@ V2_MARKERS = {
     "tag": {"location", "comments", "disable_override"},
     "policy": {"location", "rules"},
     "rule_group": {"location", "rules", "position"},
+    "addresses": {"location", "addresses"},
 }
 
 
@@ -708,6 +712,56 @@ def conv_tag(b, ctx):
     return TARGETS["tag"][pano], body
 
 
+ADDR_TYPES = {"ip_netmask": "ip-netmask", "ip_range": "ip-range", "fqdn": "fqdn", "ip_wildcard": "ip-wildcard"}
+
+
+def conv_addresses(b, ctx):
+    """v2 panos_addresses (map) -> v1 panos_address_objects (repeated object { } blocks)."""
+    a, res = b.attrs(), f"{b.labels[0]}.{b.labels[1]}"
+    pano, loc = location_v1(a, res, ctx)
+    body = list(loc)
+    raw = a.get("addresses")
+    m = parse_expr(raw) if raw is not None else {}
+    if isinstance(m, dict):
+        for key, entry in m.items():
+            if not isinstance(entry, dict):
+                ctx.warn(res, f"address '{key}' is not a literal object ({entry}) - could not be converted")
+                entry = {}
+            obj = [("name", q(key))]
+            found = [k for k in ADDR_TYPES if k in entry]
+            if found:
+                obj += [("type", q(ADDR_TYPES[found[0]])), ("value", entry[found[0]])]
+                if len(found) > 1:
+                    ctx.warn(res, f"address '{key}' sets more than one of {found} - kept {found[0]}")
+            else:
+                ctx.warn(res, f"address '{key}' has no ip_netmask/ip_range/fqdn/ip_wildcard - set type/value by hand")
+                obj += [("type", q("ip-netmask")), ("value", q(""))]
+            for k in ("description", "tags"):
+                if k in entry:
+                    obj.append((k, entry[k]))
+            for k in entry:
+                if k not in ADDR_TYPES and k not in ("description", "tags", "disable_override"):
+                    ctx.warn(res, f"address '{key}': '{k}' has no v1 equivalent - dropped")
+            body.append(("object", ("block", obj)))
+    else:
+        # addresses comes from a variable / local / for-expression: use a dynamic block
+        lk = lambda k: f'lookup(object.value, "{k}", null)'
+        body.append(('dynamic "object"', ("block", [
+            ("for_each", m),
+            ("content", ("block", [
+                ("name", Raw("object.key")),
+                ("type", Raw(f'{lk("fqdn")} != null ? "fqdn" : {lk("ip_range")} != null ? "ip-range" : '
+                             f'{lk("ip_wildcard")} != null ? "ip-wildcard" : "ip-netmask"')),
+                ("value", Raw(f'coalesce({lk("ip_netmask")}, {lk("ip_range")}, {lk("fqdn")}, {lk("ip_wildcard")})')),
+                ("description", Raw(lk("description"))),
+                ("tags", Raw(lk("tags"))),
+            ])),
+        ])))
+        ctx.warn(res, "addresses is not a literal map - converted to a dynamic \"object\" block, check it")
+    leftover(a, {"location", "vsys", "device_group", "addresses"}, res, ctx)
+    return TARGETS["addresses"][pano], body
+
+
 RULE_SAME = ["description", "group_tag", "source_zones", "source_addresses", "negate_source",
              "source_users", "destination_zones", "destination_addresses", "negate_destination",
              "applications", "services", "action", "log_setting", "log_start", "log_end", "disabled",
@@ -825,7 +879,8 @@ def conv_resource(b, ctx):
     kind = KIND[b.labels[0]]
     a = b.attrs()
     markers = V2_MARKERS[kind]
-    is_v2 = bool(markers & set(a)) or b.labels[0] in ("panos_address", "panos_service", "panos_security_policy_rules")
+    is_v2 = bool(markers & set(a)) or b.labels[0] in ("panos_address", "panos_service", "panos_security_policy_rules",
+                                                       "panos_addresses")
     if kind == "service" and "protocol" in a and a["protocol"].lstrip().startswith("{"):
         is_v2 = True
     if not is_v2:
@@ -833,7 +888,7 @@ def conv_resource(b, ctx):
         return b.raw
     todo_count_before = len(ctx.todo)
     fn = {"address": conv_address, "address_group": conv_address_group, "service": conv_service,
-          "service_group": conv_service_group, "tag": conv_tag}.get(kind)
+          "service_group": conv_service_group, "tag": conv_tag, "addresses": conv_addresses}.get(kind)
     if fn:
         newtype, body = fn(b, ctx)
     else:
@@ -922,6 +977,17 @@ def check_attribute_references(text, ctx):
                           f"- fix that reference")
 
 
+def flag_leftovers(fname, text, ctx):
+    """Report references that have no v1 equivalent."""
+    for n, line in enumerate(text.split("\n"), 1):
+        if re.search(r"panos_address_objects\.[\w-]+\.addresses\b", line):
+            ctx.todo.append((fname + " (converted)", f"line {n}", "refers to the v2 addresses map - in v1 use the object name as a "
+                             "string (e.g. \"web-server\") plus depends_on = [panos_address_objects.<name>]"))
+        if "provider::panos::" in line:
+            ctx.todo.append((fname + " (converted)", f"line {n}", "uses a v2 provider function (provider::panos::...) - not "
+                             "available in v1 (or Terraform 1.5), rewrite by hand"))
+
+
 def convert_text(text, ctx):
     out = []
     for item in parse_body(text):
@@ -970,6 +1036,7 @@ def main():
         ctx.file = os.path.basename(f)
         text = fix_references(text, ctx)
         check_attribute_references(text, ctx)
+        flag_leftovers(os.path.basename(f), text, ctx)
         with open(target, "w", encoding="utf-8") as fh:
             fh.write(text)
         print(f"  {f}  ->  {target}")
