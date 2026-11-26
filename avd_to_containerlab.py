@@ -33,8 +33,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
+# --------------------------------------------------------------------------
+# Constants and patterns
+# --------------------------------------------------------------------------
+
+# cEOS always calls its management port Management0, whatever the hardware
+# switch calls it (Management1, Management1/1 ...).
 CEOS_MANAGEMENT_INTERFACE_NAME = "Management0"
-LARGEST_POINT_TO_POINT_PREFIX_LENGTH = 30  # /30 and /31 are treated as point-to-point
+
+# A subnet this small can only hold two addresses, so two interfaces sharing
+# it must be the two ends of one cable. /30 and /31 both qualify.
+LARGEST_POINT_TO_POINT_PREFIX_LENGTH = 30
 
 # Top-level commands (and everything indented beneath them) that cEOS cannot run.
 UNSUPPORTED_TOP_LEVEL_COMMAND_PATTERNS = [
@@ -52,17 +61,30 @@ UNSUPPORTED_INDENTED_COMMAND_PATTERNS = [
     re.compile(r"^\s+mac timestamp "),
 ]
 
+# Patterns that pick the interesting lines out of an EOS config.
+#   hostname dc1-leaf1a
+#   interface Ethernet1
+#      description P2P_LINK_TO_DC1-SPINE1_Ethernet1
+#      ip address 10.255.255.1/31
 HOSTNAME_PATTERN = re.compile(r"^hostname (?P<hostname>\S+)")
 INTERFACE_HEADER_PATTERN = re.compile(r"^interface (?P<interface_name>\S+)")
 DESCRIPTION_PATTERN = re.compile(r"^\s+description (?P<description>.+)$")
 IPV4_ADDRESS_PATTERN = re.compile(r"^\s+ip address (?P<address>\d+\.\d+\.\d+\.\d+/\d+)")
 VRF_MEMBERSHIP_PATTERN = re.compile(r"^\s+vrf (?:forwarding )?(?P<vrf_name>\S+)")
+
+# A physical front-panel port: Ethernet1, Ethernet3/1, Ethernet3/1/1.
 ETHERNET_INTERFACE_PATTERN = re.compile(r"^Ethernet\d+(?:/\d+)*$")
+
+# A description that ends in an interface name, e.g. "..._Ethernet3/1".
+# Whatever comes before the interface is checked for a switch hostname later.
 DESCRIPTION_PEER_INTERFACE_PATTERN = re.compile(
     r"^(?P<text_before_interface>.*?)[\s_:\-]*"
     r"(?:Ethernet|Eth|Et)(?P<port_numbers>\d+(?:/\d+)*)$",
     re.IGNORECASE,
 )
+
+# A static default route, with or without a VRF:
+#   ip route vrf MGMT 0.0.0.0/0 10.0.0.1
 DEFAULT_ROUTE_PATTERN = re.compile(
     r"^(?P<route_prefix>ip route (?:vrf \S+ )?0\.0\.0\.0/0 )"
     r"(?P<next_hop>\d+\.\d+\.\d+\.\d+)(?P<route_suffix>.*)$"
@@ -72,6 +94,13 @@ DEFAULT_ROUTE_PATTERN = re.compile(
 Endpoint = Tuple[str, str]
 
 
+# --------------------------------------------------------------------------
+# Data model
+# --------------------------------------------------------------------------
+
+# What we need to know about one front-panel port in order to work out what
+# it is cabled to: its description and any subnets configured on it
+# (including those on its sub-interfaces).
 @dataclass
 class EthernetInterface:
     interface_name: str
@@ -79,6 +108,9 @@ class EthernetInterface:
     ipv4_networks: List[ipaddress.IPv4Network] = field(default_factory=list)
 
 
+# Everything read from one AVD .cfg file: the raw lines (kept so the config
+# can be rewritten later), the front-panel ports, and the real management
+# port name and subnet (needed to swap them for lab values).
 @dataclass
 class SwitchConfig:
     hostname: str
@@ -93,8 +125,11 @@ class SwitchConfig:
 # Parsing the AVD configs
 # --------------------------------------------------------------------------
 
+# EOS config is indentation based: a top-level command (e.g. "interface
+# Ethernet1") owns the indented lines beneath it. This groups the flat list
+# of lines into those blocks so a whole stanza can be read, rewritten or
+# dropped as one unit. Each block is [top-level line, child line, ...].
 def split_into_config_blocks(config_lines: List[str]) -> List[List[str]]:
-    """Group lines into blocks: one top-level line plus its indented children."""
     config_blocks: List[List[str]] = []
     for config_line in config_lines:
         is_indented = config_line[:1] in (" ", "\t")
@@ -105,7 +140,10 @@ def split_into_config_blocks(config_lines: List[str]) -> List[List[str]]:
     return config_blocks
 
 
+# Read one AVD .cfg file and pull out the hostname, every front-panel port
+# (description + subnets) and the management port. Nothing is modified here.
 def parse_switch_config(config_path: Path) -> SwitchConfig:
+    # Until a "hostname" line is found, fall back to the file name.
     config_lines = config_path.read_text(encoding="utf-8", errors="replace").splitlines()
     switch = SwitchConfig(hostname=config_path.stem, source_path=config_path,
                           config_lines=config_lines)
@@ -113,16 +151,19 @@ def parse_switch_config(config_path: Path) -> SwitchConfig:
     for config_block in split_into_config_blocks(config_lines):
         header_line = config_block[0]
 
+        # "hostname X" - the name used for the lab node.
         hostname_match = HOSTNAME_PATTERN.match(header_line)
         if hostname_match:
             switch.hostname = hostname_match.group("hostname")
             continue
 
+        # Only interface stanzas matter from here on.
         interface_match = INTERFACE_HEADER_PATTERN.match(header_line)
         if not interface_match:
             continue
         interface_name = interface_match.group("interface_name")
 
+        # Collect the description and IPv4 subnets from the stanza's children.
         description = ""
         ipv4_networks: List[ipaddress.IPv4Network] = []
         for stanza_line in config_block[1:]:
@@ -134,14 +175,17 @@ def parse_switch_config(config_path: Path) -> SwitchConfig:
                 ipv4_networks.append(
                     ipaddress.ip_interface(address_match.group("address")).network)
 
+        # Management ports are remembered separately, never cabled.
+        # The first one carrying an address is treated as "the" management port.
         if interface_name.startswith("Management"):
-            # The first management interface carrying an address is "the" one.
             if switch.management_interface_name is None and ipv4_networks:
                 switch.management_interface_name = interface_name
                 switch.management_network = ipv4_networks[0]
             continue
 
-        # Sub-interfaces (Ethernet1.100) ride on the parent's cable.
+        # Sub-interfaces (Ethernet1.100) ride on the parent's cable, so their
+        # subnets are recorded against the parent port. Port-Channels, Vlans,
+        # Loopbacks etc. are not physical ports and are skipped.
         parent_interface_name = interface_name.split(".")[0]
         if not ETHERNET_INTERFACE_PATTERN.match(parent_interface_name):
             continue
@@ -158,36 +202,47 @@ def parse_switch_config(config_path: Path) -> SwitchConfig:
 # Link discovery
 # --------------------------------------------------------------------------
 
+# Sort key that orders numbers by value instead of alphabetically, so
+# Ethernet10 comes after Ethernet9 and leaf10 after leaf9. Keeps the
+# generated files in a stable, readable order (clean diffs in CI).
 def natural_sort_key(text: str) -> List[object]:
-    """Sort 'Ethernet10' after 'Ethernet9' and 'leaf10' after 'leaf9'."""
     return [int(piece) if piece.isdigit() else piece.lower()
             for piece in re.split(r"(\d+)", text)]
 
 
+# Sort key for one cable end: by switch name, then by interface.
 def endpoint_sort_key(endpoint: Endpoint) -> List[object]:
     hostname, interface_name = endpoint
     return natural_sort_key(hostname) + natural_sort_key(interface_name)
 
 
+# Build a link from two cable ends, always in the same order. Both switches
+# describe the same cable from opposite sides; ordering the ends means the
+# cable is stored once rather than twice.
 def make_link(first_endpoint: Endpoint, second_endpoint: Endpoint) -> Tuple[Endpoint, Endpoint]:
-    """Order the two endpoints consistently so a link is only ever stored once."""
     ordered_endpoints = sorted([first_endpoint, second_endpoint], key=endpoint_sort_key)
     return ordered_endpoints[0], ordered_endpoints[1]
 
 
+# Work out which switch and port an interface description points at.
+# Accepts any description shaped "<anything><known hostname><separator>
+# <Ethernet interface>", which covers the AVD default formats:
+#   AVD 4.x  P2P_LINK_TO_DC1-SPINE1_Ethernet1   MLAG_PEER_dc1-leaf1b_Ethernet3
+#   AVD 5.x  P2P_dc1-spine1_Ethernet1           MLAG_dc1-leaf1b_Ethernet3
+# Returns (peer hostname, peer interface), or None when the description does
+# not name a switch in this fabric (a server port, for example).
 def find_peer_endpoint_in_description(
     description: str, hostname_by_lowercase: Dict[str, str]
 ) -> Optional[Endpoint]:
-    """Return (peer hostname, peer interface) if the description ends with one.
-
-    Works for any description of the form "<anything><known hostname><separator>
-    <Ethernet interface>", which covers the AVD 4.x and 5.x default formats.
-    """
+    # Step 1: the description must end with an interface name.
     description_match = DESCRIPTION_PEER_INTERFACE_PATTERN.match(description.strip())
     if not description_match:
         return None
     text_before_interface = description_match.group("text_before_interface").lower()
 
+    # Step 2: the text just before the interface must end with a known
+    # hostname. Matching ignores case (AVD 4.x upper-cases the peer name) and
+    # the longest hostname wins, so "dc1-leaf1" beats a shorter "leaf1".
     matched_hostname: Optional[str] = None
     for lowercase_hostname, hostname in hostname_by_lowercase.items():
         if not text_before_interface.endswith(lowercase_hostname):
@@ -205,13 +260,20 @@ def find_peer_endpoint_in_description(
     return matched_hostname, "Ethernet" + description_match.group("port_numbers")
 
 
+# Work out every switch-to-switch cable in the fabric, in two passes:
+#   pass 1 - routed links, matched by a shared /31 or /30 (most reliable)
+#   pass 2 - whatever is left, matched by interface descriptions
+# A port can only hold one cable, so each cable end is used at most once.
+# Anything ambiguous is skipped and reported in `warnings`, never guessed.
 def discover_links(
     switches: Dict[str, SwitchConfig], warnings: List[str]
 ) -> List[Tuple[Endpoint, Endpoint]]:
+    # links: the cables found so far. connected_endpoints: ports already used.
     links: Set[Tuple[Endpoint, Endpoint]] = set()
     connected_endpoints: Set[Endpoint] = set()
 
     # Pass 1: routed point-to-point links, matched by shared subnet.
+    # First index every point-to-point subnet by the ports it is configured on.
     endpoints_by_network: Dict[ipaddress.IPv4Network, Set[Endpoint]] = {}
     for switch in switches.values():
         for ethernet_interface in switch.ethernet_interfaces.values():
@@ -220,6 +282,7 @@ def discover_links(
                     endpoints_by_network.setdefault(ipv4_network, set()).add(
                         (switch.hostname, ethernet_interface.interface_name))
 
+    # A subnet seen on exactly two ports of two different switches is a cable.
     for ipv4_network, network_endpoints in sorted(endpoints_by_network.items()):
         if len(network_endpoints) < 2:
             continue  # the other end is not a switch in this fabric
@@ -242,6 +305,7 @@ def discover_links(
         connected_endpoints.update((first_endpoint, second_endpoint))
 
     # Pass 2: remaining interfaces, matched by what their descriptions claim.
+    # First record, for every port, the peer port its description points at.
     hostname_by_lowercase = {hostname.lower(): hostname for hostname in switches}
     claimed_peer_by_endpoint: Dict[Endpoint, Endpoint] = {}
     for switch in switches.values():
@@ -252,6 +316,8 @@ def discover_links(
                 claimed_peer_by_endpoint[
                     (switch.hostname, ethernet_interface.interface_name)] = claimed_peer_endpoint
 
+    # Then turn each claim into a cable, unless the cable already exists, a
+    # port is already in use, or the far end's description points elsewhere.
     for local_endpoint in sorted(claimed_peer_by_endpoint, key=endpoint_sort_key):
         peer_endpoint = claimed_peer_by_endpoint[local_endpoint]
         if make_link(local_endpoint, peer_endpoint) in links:
@@ -277,12 +343,20 @@ def discover_links(
 # cEOS adaptation
 # --------------------------------------------------------------------------
 
+# Translate an EOS port name into the Linux interface name containerlab
+# creates inside the cEOS container: Ethernet1 -> eth1, Ethernet3/1 -> eth3_1.
+# cEOS turns the underscore back into a slash when it boots.
 def eos_interface_to_container_interface(eos_interface_name: str) -> str:
-    """Ethernet1 -> eth1, Ethernet3/1 -> eth3_1 (cEOS maps '_' back to '/')."""
     port_numbers = eos_interface_name[len("Ethernet"):]
     return "eth" + port_numbers.replace("/", "_")
 
 
+# Produce the startup config for the lab copy of one switch. The production
+# config is kept as-is except for what cannot work in a container:
+#   - hardware-only commands are removed
+#   - the management port becomes Management0 with its lab address
+#   - the management default route is pointed at the lab gateway
+# Returns the new config as a single string.
 def adapt_config_for_ceos(
     switch: SwitchConfig,
     lab_management_address: ipaddress.IPv4Interface,
@@ -294,8 +368,12 @@ def adapt_config_for_ceos(
     for config_block in split_into_config_blocks(switch.config_lines):
         header_line = config_block[0]
 
+        # Drop hardware-only top-level commands together with their children.
         if any(pattern.match(header_line) for pattern in UNSUPPORTED_TOP_LEVEL_COMMAND_PATTERNS):
             continue
+
+        # Rewrite the management port stanza: rename it to Management0 and
+        # swap the real address for the lab one, keeping description/VRF etc.
 
         interface_match = INTERFACE_HEADER_PATTERN.match(header_line)
         if interface_match and interface_match.group("interface_name").startswith("Management"):
@@ -310,6 +388,9 @@ def adapt_config_for_ceos(
             management_interface_written = True
             continue
 
+        # Repoint the management default route at the lab gateway. Only a
+        # default route whose next hop sits in the real management subnet is
+        # touched, so genuine fabric default routes are left alone.
         default_route_match = DEFAULT_ROUTE_PATTERN.match(header_line)
         if default_route_match and switch.management_network is not None:
             original_next_hop = ipaddress.ip_address(default_route_match.group("next_hop"))
@@ -320,6 +401,8 @@ def adapt_config_for_ceos(
                     + default_route_match.group("route_suffix"))
                 continue
 
+        # Every other block is copied through unchanged, minus any
+        # hardware-only lines inside it (interface speed, FEC ...).
         for config_line in config_block:
             if any(pattern.match(config_line)
                    for pattern in UNSUPPORTED_INDENTED_COMMAND_PATTERNS):
@@ -351,10 +434,14 @@ def adapt_config_for_ceos(
     return adapted_config
 
 
+# Hand out lab management addresses. containerlab gives the first usable
+# address of the subnet to the docker bridge (the lab gateway); the switches
+# take the following addresses in hostname order, so reruns give every switch
+# the same address as long as the set of switches is unchanged.
+# Returns (gateway address, {hostname: address with prefix length}).
 def allocate_lab_management_addresses(
     hostnames: List[str], lab_management_subnet: ipaddress.IPv4Network
 ) -> Tuple[ipaddress.IPv4Address, Dict[str, ipaddress.IPv4Interface]]:
-    """First usable address is the docker bridge gateway; switches follow in order."""
     usable_addresses = lab_management_subnet.hosts()
     lab_management_gateway = next(usable_addresses)
     address_by_hostname: Dict[str, ipaddress.IPv4Interface] = {}
@@ -374,6 +461,10 @@ def allocate_lab_management_addresses(
 # Topology file
 # --------------------------------------------------------------------------
 
+# Build the text of the containerlab topology file (<lab-name>.clab.yml):
+# the management network, one cEOS node per switch (with its fixed management
+# address and startup config) and one entry per discovered cable.
+# The YAML is written by hand so the script needs no third-party packages.
 def render_topology_yaml(
     lab_name: str,
     ceos_image: str,
@@ -382,6 +473,7 @@ def render_topology_yaml(
     links: List[Tuple[Endpoint, Endpoint]],
     startup_configs_directory_name: str,
 ) -> str:
+    # Header: lab name, management network and the image shared by all nodes.
     yaml_lines = [
         "# Generated by avd_to_containerlab.py - do not edit, regenerate instead.",
         f'name: "{lab_name}"',
@@ -397,6 +489,7 @@ def render_topology_yaml(
         "",
         "  nodes:",
     ]
+    # One node per switch. startup-config paths are relative to this file.
     for hostname, management_address in management_address_by_hostname.items():
         yaml_lines += [
             f'    "{hostname}":',
@@ -404,6 +497,7 @@ def render_topology_yaml(
             f'      mgmt-ipv4: "{management_address.ip}"',
             f'      startup-config: "{startup_configs_directory_name}/{hostname}.cfg"',
         ]
+    # One link per cable, using the container-side interface names.
     yaml_lines += ["", "  links:" if links else "  links: []"]
     for (first_hostname, first_interface), (second_hostname, second_interface) in links:
         first_container_interface = eos_interface_to_container_interface(first_interface)
@@ -418,6 +512,8 @@ def render_topology_yaml(
 # Command line
 # --------------------------------------------------------------------------
 
+# Define and read the command-line options. Only --configs-directory is
+# required; everything else has a default.
 def parse_command_line() -> argparse.Namespace:
     argument_parser = argparse.ArgumentParser(
         description="Generate a containerlab cEOS lab from Arista AVD switch configs.")
@@ -443,16 +539,21 @@ def parse_command_line() -> argparse.Namespace:
     return argument_parser.parse_args()
 
 
+# Run the whole conversion: read the configs, find the cables, write the
+# startup configs and topology file, then print a summary.
+# Returns the process exit code (0 = success, 1 = nothing was generated).
 def main() -> int:
     arguments = parse_command_line()
     lab_management_subnet = ipaddress.ip_network(arguments.management_subnet)
 
+    # Step 1: find the AVD config files.
     config_paths = sorted(arguments.configs_directory.glob(arguments.config_file_pattern))
     if not config_paths:
         print(f"error: no files matching {arguments.config_file_pattern!r} in "
               f"{arguments.configs_directory}", file=sys.stderr)
         return 1
 
+    # Step 2: parse each config. Two files claiming one hostname is an error.
     warnings: List[str] = []
     switches: Dict[str, SwitchConfig] = {}
     for config_path in config_paths:
@@ -463,6 +564,8 @@ def main() -> int:
             return 1
         switches[switch.hostname] = switch
 
+    # Step 3: refuse a lab management subnet that overlaps a real one, since
+    # the lab bridge would then capture this server's traffic to production.
     sorted_hostnames = sorted(switches, key=natural_sort_key)
     for hostname in sorted_hostnames:
         real_management_network = switches[hostname].management_network
@@ -472,10 +575,12 @@ def main() -> int:
                   f"choose another with --management-subnet", file=sys.stderr)
             return 1
 
+    # Step 4: work out the cabling and the lab management addressing.
     links = discover_links(switches, warnings)
     lab_management_gateway, management_address_by_hostname = (
         allocate_lab_management_addresses(sorted_hostnames, lab_management_subnet))
 
+    # Step 5: write a cEOS-ready startup config for every switch.
     startup_configs_directory_name = "configs"
     startup_configs_directory = arguments.output_directory / startup_configs_directory_name
     startup_configs_directory.mkdir(parents=True, exist_ok=True)
@@ -484,6 +589,7 @@ def main() -> int:
             switches[hostname], management_address_by_hostname[hostname], lab_management_gateway)
         (startup_configs_directory / f"{hostname}.cfg").write_text(adapted_config, encoding="utf-8")
 
+    # Step 6: write the containerlab topology file.
     topology_path = arguments.output_directory / f"{arguments.lab_name}.clab.yml"
     topology_path.write_text(
         render_topology_yaml(
@@ -491,7 +597,9 @@ def main() -> int:
             management_address_by_hostname, links, startup_configs_directory_name),
         encoding="utf-8")
 
-    # Report what was built, and which configured ports ended up with no cable.
+    # Step 7: report what was built, and which configured ports ended up with
+    # no cable (normally server-facing or unused ports - worth a glance, as a
+    # missed fabric link would show up here too).
     connected_endpoints = {endpoint for link in links for endpoint in link}
     print(f"switches : {len(sorted_hostnames)}")
     print(f"links    : {len(links)}")
@@ -510,5 +618,6 @@ def main() -> int:
     return 0
 
 
+# Only run when executed as a script, not when imported.
 if __name__ == "__main__":
     sys.exit(main())
